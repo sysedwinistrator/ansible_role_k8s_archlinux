@@ -1,0 +1,344 @@
+---
+- name: Install iptables-nft (force)
+  community.general.pacman:
+    name: iptables-nft
+    state: present
+    extra_args: "--ask 4"
+    update_cache: yes
+- name: Install packages
+  community.general.pacman:
+    name:
+      - kubelet
+      - kubeadm
+      - cri-o
+    state: present
+    update_cache: yes
+- name: Install podman for multi master
+  community.general.pacman:
+    name:
+      - podman
+    state: present
+    update_cache: yes
+  when: k8s_multimaster
+- name: LXC kmsg
+  ansible.builtin.copy:
+    dest: /etc/tmpfiles.d/kmsg.conf
+    content: "L /dev/kmsg - - - - /dev/console"
+  notify: restart systemd_tmpfiles
+  when: "'lxc' in ansible_virtualization_tech_guest"
+- name: Flush handlers
+  meta: flush_handlers
+- name: IPVS configuration
+  block:
+    - name: Add required IPVS modules to /etc/modules-load.d
+      ansible.builtin.lineinfile:
+        path: /etc/modules-load.d/ansible-kubernetes.conf
+        line: "{{ item }}"
+        owner: root
+        group: root
+        mode: 0644
+        create: yes
+      loop: "{{ k8s_kernel_modules_ipvs }}"
+    - name: Load IPVS modules
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop: "{{ k8s_kernel_modules_ipvs }}"
+  when: k8s_ipvs
+- name: br_netfilter
+  block:
+    - name: Add modules to /etc/modules-load.d
+      ansible.builtin.copy:
+        content: |
+          br_netfilter
+          nf_conntrack
+        dest: /etc/modules-load.d/ansible-kubernetes.conf
+        owner: root
+        group: root
+        mode: 0644
+    - name: Load br_netfilter
+      community.general.modprobe:
+        name: br_netfilter
+        state: present
+- name: Back off, systemd-networkd!
+  ansible.builtin.copy:
+    content: |
+      [Match]
+      OriginalName=flannel* kube-bridge kube-dummy-if kube-ipvs0
+      [Link]
+      MACAddressPolicy=none
+    dest: /etc/systemd/network/50-flannel.link
+    owner: systemd-network
+    group: systemd-network
+  notify: restart systemd-networkd
+- name: Delete kubelet.env
+  ansible.builtin.file:
+    path: /etc/kubernetes/kubelet.env
+    state: absent
+  notify: restart kubelet
+- name: Flush handlers
+  meta: flush_handlers
+- name: Reset kubelet
+  block:
+    - name: Populate service facts
+      ansible.builtin.service_facts:
+    - name: Reset kubelet
+      ansible.builtin.shell:
+        cmd: kubeadm reset -f
+    - name: Stop any kube systemd units, including slices
+      ansible.builtin.shell:
+        cmd: "systemctl stop 'kube*'"
+      ignore_errors: yes
+    - name: Restart iptables
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: restarted
+      loop: "{{ k8s_reset_services_to_restart }}"
+      when: ansible_facts.services[k8s_reset_services_to_restart] is defined
+  when: k8s_reset
+- name: Container runtime setup
+  block:
+  - name: registries.conf
+    ansible.builtin.template:
+      src: registries.conf.j2
+      dest: /etc/containers/registries.conf
+    notify: restart crio
+  - name: Set cri-o container runtime to runc
+    community.general.ini_file:
+      path: /etc/crio/crio.conf
+      create: yes
+      section: crio.runtime
+      option: default_runtime
+      value: "\"runc\""
+    notify: restart crio
+  - name: Set cri-o container cgroup manager to systemd
+    community.general.ini_file:
+      path: /etc/crio/crio.conf
+      create: yes
+      section: crio.runtime
+      option: cgroup_manager
+      value: "\"systemd\""
+    notify: restart crio
+  - name: Set cri-o CNI plugin dir to /opt/cni/bin
+    community.general.ini_file:
+      path: /etc/crio/crio.conf
+      create: yes
+      section: crio.network
+      option: plugin_dirs
+      value: "[\"/opt/cni/bin\"]"
+    notify: restart crio
+  - name: Set cri-o CNI config dir to /etc/cni/net.d
+    community.general.ini_file:
+      path: /etc/crio/crio.conf
+      create: yes
+      section: crio.network
+      option: network_dir
+      value: "\"/etc/cni/net.d\""
+    notify: restart crio
+  - name: Global container config
+    block:
+      - name: Set container runtime to runc
+        community.general.ini_file:
+          path: /etc/containers/containers.conf
+          create: no
+          section: engine
+          option: runtime
+          value: "\"runc\""
+      - name: Set container cgroup manager to systemd
+        community.general.ini_file:
+          path: /etc/containers/containers.conf
+          create: no
+          section: engine
+          option: cgroup_manager
+          value: "\"systemd\""
+    when: k8s_global_runtime_config
+  - name: BTRFS storage setup
+    block:
+      - name: Set storage driver to btrfs
+        community.general.ini_file:
+          path: /etc/containers/storage.conf
+          create: no
+          section: storage
+          option: driver
+          value: "\"btrfs\""
+        notify: restart crio
+      - name: Get root uuid
+        ansible.builtin.set_fact:
+          root_uuid: "{{ (ansible_facts.mounts | selectattr('mount','in','/') | list | map(attribute='uuid')) | list | join(' ') }}"
+      - name: Mount btrfs-top-lvl
+        ansible.posix.mount:
+          src: "UUID={{ root_uuid }}"
+          path: "{{ btrfs_top_lvl_mnt }}"
+          fstype: btrfs
+          opts: rw,relatime,space_cache
+          state: mounted
+      - name: Delete all container subvolumes
+        ansible.builtin.shell:
+          cmd: btrfs subvolume delete /var/lib/containers/storage/btrfs/subvolumes/*
+        when: k8s_storage_reset
+        ignore_errors: yes
+      - name: Unmount /var/lib/containers/storage/btrfs
+        ansible.posix.mount:
+          path: /var/lib/containers/storage/btrfs
+          state: unmounted
+        when: k8s_storage_reset
+        ignore_errors: yes
+      - name: Unmount containers-storage subvol
+        ansible.posix.mount:
+          src: "UUID={{ root_uuid }}"
+          path: /var/lib/containers/storage
+          fstype: btrfs
+          opts: rw,relatime,space_cache,subvol=containers-storage,nodatacow,compression=no
+          state: unmounted
+        when: k8s_storage_reset
+        ignore_errors: yes
+      - name: Delete containers-storage subvol
+        ansible.builtin.shell:
+          chdir: "{{ btrfs_top_lvl_mnt }}"
+          cmd: btrfs subvolume delete containers-storage
+          removes: "{{ btrfs_top_lvl_mnt }}/containers-storage"
+        when: k8s_storage_reset
+      - name: Delete /var/lib/containers/storage
+        ansible.builtin.file:
+          path: /var/lib/containers/storage
+          state: absent
+        when: k8s_storage_reset
+      - name: Create containers-storage subvol
+        ansible.builtin.shell:
+          chdir: "{{ btrfs_top_lvl_mnt }}"
+          cmd: btrfs subvolume create containers-storage
+          creates: "{{ btrfs_top_lvl_mnt }}/containers-storage"
+      - name: Create /var/lib/containers/storage
+        ansible.builtin.file:
+          path: /var/lib/containers/storage
+          state: directory
+          mode: 0700
+          owner: root
+          group: root
+      - name: Mount containers-storage subvol
+        ansible.posix.mount:
+          src: "UUID={{ root_uuid }}"
+          path: /var/lib/containers/storage
+          fstype: btrfs
+          opts: rw,relatime,space_cache,subvol=containers-storage,nodatacow,compression=no
+          state: mounted
+    when: btrfs_top_lvl_mnt|length > 0
+  - name: Set storage driver to vfs
+    community.general.ini_file:
+      path: /etc/containers/storage.conf
+      create: no
+      section: storage
+      option: driver
+      value: "\"vfs\""
+    when: "'lxc' in ansible_virtualization_tech_guest"
+  - name: Reset storage
+    block:
+      - name: Delete /var/lib/containers/storage
+        ansible.builtin.file:
+          path: /var/lib/containers/storage
+          state: absent
+      - name: Create /var/lib/containers/storage
+        ansible.builtin.file:
+          path: /var/lib/containers/storage
+          state: directory
+          mode: 0700
+          owner: root
+          group: root
+    when: k8s_storage_reset
+- name: Start and enable crio.service
+  ansible.builtin.systemd:
+    name: crio
+    enabled: yes
+    state: started
+- name: Start and enable kubelet.service
+  ansible.builtin.systemd:
+    name: kubelet
+    enabled: yes
+    state: started
+- name: Check for kube-apiserver manifest
+  ansible.builtin.stat:
+    path: /etc/kubernetes/manifests/kube-apiserver.yaml
+  register: k8s_apiserver_manifest_probe
+  when: "'k8s_master' in group_names"
+- name: Find master node that is already initialized
+  ansible.builtin.set_fact:
+    k8s_bootstrap_node: "{% set nodes = [] %}{% for host in groups['k8s_master'] %}{% if hostvars[host].k8s_apiserver_manifest_probe.stat.exists %}{{ nodes.append(hostvars[host].inventory_hostname) }}{% endif %}{% endfor %}{% if nodes | length > 0 %}{{ nodes| list | first }}{% endif %}"
+  run_once: true
+- name: Cluster initialization
+  block:
+    - name: Create certificateKey
+      ansible.builtin.shell:
+        cmd: "kubeadm certs certificate-key"
+      register: k8s_certificate_key_gen
+      when: "'k8s_master'in group_names and k8s_certificate_key is not defined"
+      run_once: true
+    - name: Register certificateKey
+      ansible.builtin.set_fact:
+        k8s_certificate_key: "{{ k8s_certificate_key_gen.stdout }}"
+      when: "'k8s_master'in group_names and k8s_certificate_key is not defined"
+    - name: Create random bootstrap token
+      ansible.builtin.shell:
+        cmd: "tr -dc a-z0-9 </dev/random| head -c6; printf '.'; tr -dc a-z0-9 </dev/random| head -c16"
+      register: k8s_bootstrap_token_gen
+      run_once: true
+    - name: Set bootstrap token as fact
+      ansible.builtin.set_fact:
+        k8s_bootstrap_token: "{{ k8s_bootstrap_token_gen.stdout }}"
+  when: k8s_bootstrap_node | length == 0
+- name: Generate kube-vip manifest
+  ansible.builtin.shell:
+    cmd: "podman run --rm --network host ghcr.io/kube-vip/kube-vip:v0.4.0 manifest pod --interface {{ k8s_kube_vip_interface | default(ansible_default_ipv4.alias) }} --vip {{ k8s_apiserver_vip }} --arp --controlplane --leaderElection"
+    creates: /etc/kubernetes/manifests/kube-vip.yaml
+  register: k8s_kube_vip_manifest
+  when: "'k8s_master' in group_names and k8s_multimaster"
+- name: Create kubeadm token
+  ansible.builtin.shell:
+    cmd: kubeadm token create
+  register: k8s_kubeadm_token
+  delegate_to: "{{ k8s_bootstrap_node }}"
+  when: k8s_bootstrap_node | length > 0
+- name: Print kubeadm token
+  ansible.builtin.debug:
+    var: k8s_kubeadm_token
+- name: Set kubeadm token as fact
+  ansible.builtin.set_fact:
+    k8s_bootstrap_token: "{{ k8s_kubeadm_token.stdout }}"
+  when: k8s_bootstrap_node | length > 0
+- name: Copy kube-vip manifest
+  ansible.builtin.copy:
+    content: "{{ k8s_kube_vip_manifest.stdout }}"
+    dest: /etc/kubernetes/manifests/kube-vip.yaml
+  when: k8s_bootstrap_node | length == 0 and k8s_multimaster
+  run_once: true
+- name: Copy kubeadm init config
+  ansible.builtin.template:
+    src: kubeadm-init.yml.j2
+    dest: /tmp/kubeadm-init.yml
+    mode: 0600
+  when: k8s_bootstrap_node | length == 0
+  run_once: true
+- name: kubeadm init
+  ansible.builtin.shell:
+    cmd: "kubeadm init --upload-certs --config /tmp/kubeadm-init.yml"
+    creates: /etc/kubernetes/manifests/kube-apiserver.yaml
+  when: k8s_bootstrap_node | length == 0
+  run_once: true
+- name: Copy kubeadm join config
+  ansible.builtin.template:
+    src: kubeadm-join.yml.j2
+    dest: /tmp/kubeadm-join.yml
+    mode: 0600
+- name: kubeadm join
+  ansible.builtin.shell:
+    cmd: "kubeadm join --config /tmp/kubeadm-join.yml"
+    creates: /var/lib/kubelet/config.yaml
+  throttle: 1
+- name: Copy kube-vip manifest
+  ansible.builtin.copy:
+    content: "{{ k8s_kube_vip_manifest.stdout }}"
+    dest: /etc/kubernetes/manifests/kube-vip.yaml
+  when: "'k8s_master' in group_names and k8s_multimaster"
+  notify: restart kubelet
+- name: Flush handlers
+  meta: flush_handlers
+...

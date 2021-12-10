@@ -1,0 +1,18 @@
+---
+- name: restart systemd_tmpfiles
+  ansible.builtin.systemd:
+    name: "systemd-tmpfiles-setup-dev.service"
+    state: restarted
+- name: restart crio
+  ansible.builtin.systemd:
+    name: crio
+    state: restarted
+- name: restart kubelet
+  ansible.builtin.systemd:
+    name: kubelet
+    state: restarted
+- name: restart systemd-networkd
+  ansible.builtin.systemd:
+    name: systemd-networkd
+    state: restarted
+...

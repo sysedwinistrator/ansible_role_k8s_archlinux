@@ -1,0 +1,16 @@
+---
+btrfs_top_lvl_mnt: ""
+k8s_reset: false
+k8s_cluster_domain: cluster.local
+k8s_storage_reset: false
+k8s_multimaster: false
+k8s_usedns: false
+k8s_kernel_modules:
+  - br_netfilter
+k8s_reset_services_to_restart:
+  - iptables
+k8s_global_runtime_config: true
+k8s_ipvs: false
+k8s_ipvs_scheduler: rr
+k8s_allow_swap: false
+...
